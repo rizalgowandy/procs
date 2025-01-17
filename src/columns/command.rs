@@ -14,8 +14,8 @@ pub struct Command {
 impl Command {
     pub fn new(header: Option<String>) -> Self {
         let header = header.unwrap_or_else(|| String::from("Command"));
-        let unit = String::from("");
-        Command {
+        let unit = String::new();
+        Self {
             fmt_contents: HashMap::new(),
             raw_contents: HashMap::new(),
             width: 0,
@@ -25,7 +25,7 @@ impl Command {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Column for Command {
     fn add(&mut self, proc: &ProcessInfo) {
         let fmt_content = if let Ok(cmd) = &proc.curr_proc.cmdline() {
@@ -39,10 +39,10 @@ impl Column for Command {
                     })
                     .collect::<String>();
                 cmd.pop();
-                cmd = cmd.replace("\n", " ").replace("\t", " ");
+                cmd = cmd.replace(['\n', '\t'], " ");
                 cmd
             } else {
-                proc.curr_proc.stat().comm.clone()
+                format!("[{}]", proc.curr_proc.stat().comm)
             }
         } else {
             proc.curr_proc.stat().comm.clone()
@@ -56,7 +56,6 @@ impl Column for Command {
     column_default!(String);
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "macos")]
 impl Column for Command {
     fn add(&mut self, proc: &ProcessInfo) {
@@ -72,7 +71,7 @@ impl Column for Command {
                     })
                     .collect::<String>();
                 cmd.pop();
-                cmd = cmd.replace("\n", " ").replace("\t", " ");
+                cmd = cmd.replace(['\n', '\t'], " ");
                 cmd
             } else {
                 String::from("")
@@ -89,11 +88,38 @@ impl Column for Command {
     column_default!(String);
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "windows")]
 impl Column for Command {
     fn add(&mut self, proc: &ProcessInfo) {
         let fmt_content = proc.command.clone();
+        let raw_content = fmt_content.clone();
+
+        self.fmt_contents.insert(proc.pid, fmt_content);
+        self.raw_contents.insert(proc.pid, raw_content);
+    }
+
+    column_default!(String);
+}
+
+#[cfg(target_os = "freebsd")]
+impl Column for Command {
+    fn add(&mut self, proc: &ProcessInfo) {
+        let command = if proc.curr_proc.arg.is_empty() {
+            let comm = crate::util::ptr_to_cstr(proc.curr_proc.info.comm.as_ref());
+            if let Ok(comm) = comm {
+                format!("[{}]", comm.to_string_lossy())
+            } else {
+                String::from("")
+            }
+        } else {
+            let mut x = String::from("");
+            for arg in &proc.curr_proc.arg {
+                x.push_str(&arg);
+                x.push_str(" ");
+            }
+            x
+        };
+        let fmt_content = command;
         let raw_content = fmt_content.clone();
 
         self.fmt_contents.insert(proc.pid, fmt_content);

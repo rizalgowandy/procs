@@ -11,17 +11,19 @@ mod watcher;
 use crate::column::Column;
 use crate::columns::*;
 use crate::config::*;
-use crate::util::{adjust, get_theme, lap};
+use crate::util::{adjust, get_theme, lap, ArgColorMode, ArgPagerMode, ArgThemeMode};
 use crate::view::View;
 use crate::watcher::Watcher;
 use anyhow::{anyhow, Context, Error};
-use clap::{IntoApp, Parser};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use console::Term;
 use std::cmp;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{stdout, Read};
+use std::path::PathBuf;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
@@ -29,15 +31,28 @@ use unicode_width::UnicodeWidthStr;
 // Opt
 // ---------------------------------------------------------------------------------------------------------------------
 
+#[derive(Clone, Debug, ValueEnum)]
+pub enum BuiltinConfig {
+    Default,
+    Large,
+}
+
 #[derive(Debug, Parser)]
 #[clap(long_version(option_env!("LONG_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))))]
-#[clap(setting(clap::AppSettings::DeriveDisplayOrder))]
+#[clap(
+    styles(Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+    )
+)]
 /// A modern replacement for ps
 ///
 /// please see https://github.com/dalance/procs#configuration to configure columns
 pub struct Opt {
     /// Keywords for search
-    #[clap(name = "KEYWORD")]
+    #[clap(action, name = "KEYWORD")]
     pub keyword: Vec<String>,
 
     /// AND  logic for multi-keyword
@@ -96,13 +111,7 @@ pub struct Opt {
     pub watch_mode: bool,
 
     /// Insert column to slot
-    #[clap(
-        value_name = "kind",
-        short = 'i',
-        long = "insert",
-        multiple_occurrences(true),
-        number_of_values(1)
-    )]
+    #[clap(value_name = "kind", short = 'i', long = "insert", number_of_values(1))]
     pub insert: Vec<String>,
 
     /// Specified column only
@@ -126,53 +135,48 @@ pub struct Opt {
     pub sortd: Option<String>,
 
     /// Color mode
-    #[clap(
-        short = 'c',
-        long = "color",
-        possible_value = "auto",
-        possible_value = "always",
-        possible_value = "disable"
-    )]
-    pub color: Option<String>,
+    #[clap(short = 'c', long = "color")]
+    pub color: Option<ArgColorMode>,
 
     /// Theme mode
-    #[clap(
-        long = "theme",
-        possible_value = "auto",
-        possible_value = "dark",
-        possible_value = "light"
-    )]
-    pub theme: Option<String>,
+    #[clap(long = "theme")]
+    pub theme: Option<ArgThemeMode>,
 
     /// Pager mode
-    #[clap(
-        short = 'p',
-        long = "pager",
-        possible_value = "auto",
-        possible_value = "always",
-        possible_value = "disable"
-    )]
-    pub pager: Option<String>,
+    #[clap(short = 'p', long = "pager")]
+    pub pager: Option<ArgPagerMode>,
 
     /// Interval to calculate throughput
     #[clap(long = "interval", default_value = "100", value_name = "millisec")]
     pub interval: u64,
 
+    /// Use built-in configuration
+    #[clap(long = "use-config", value_name = "name")]
+    pub use_config: Option<BuiltinConfig>,
+
+    /// Load configuration from file
+    #[clap(long = "load-config", value_name = "path")]
+    pub load_config: Option<PathBuf>,
+
     /// Generate configuration sample file
-    #[clap(long = "config")]
-    pub config: bool,
+    #[clap(long = "gen-config")]
+    pub gen_config: bool,
 
     /// Generate shell completion file
-    #[clap(long = "completion", value_name = "shell")]
-    pub completion: Option<Shell>,
+    #[clap(long = "gen-completion", value_name = "shell")]
+    pub gen_completion: Option<Shell>,
 
     /// Generate shell completion file and write to stdout
-    #[clap(long = "completion-out", value_name = "shell")]
-    pub completion_out: Option<Shell>,
+    #[clap(long = "gen-completion-out", value_name = "shell")]
+    pub gen_completion_out: Option<Shell>,
 
     /// Suppress header
     #[clap(long = "no-header")]
     pub no_header: bool,
+
+    /// Path to procfs
+    #[clap(long = "procfs")]
+    pub procfs: Option<PathBuf>,
 
     /// Show debug message
     #[clap(long = "debug", hide = true)]
@@ -183,8 +187,7 @@ pub struct Opt {
 // Functions
 // ---------------------------------------------------------------------------------------------------------------------
 
-#[cfg_attr(tarpaulin, skip)]
-fn get_config() -> Result<Config, Error> {
+fn get_config(opt: &Opt) -> Result<Config, Error> {
     let dot_cfg_path = directories::BaseDirs::new()
         .map(|base| base.home_dir().join(".procs.toml"))
         .filter(|path| path.exists());
@@ -199,20 +202,32 @@ fn get_config() -> Result<Config, Error> {
                 .join("config.toml")
         })
         .filter(|path| path.exists());
-    let cfg_path = dot_cfg_path.or(app_cfg_path).or(xdg_cfg_path);
+    let etc_path = PathBuf::from("/etc/procs/procs.toml");
+    let etc_cfg_path = etc_path.exists().then_some(etc_path);
+    let cfg_path = opt
+        .load_config
+        .clone()
+        .or(dot_cfg_path)
+        .or(app_cfg_path)
+        .or(xdg_cfg_path)
+        .or(etc_cfg_path);
 
     let config: Config = if let Some(path) = cfg_path {
-        let mut f = fs::File::open(&path).context(format!("failed to open file ({:?})", path))?;
+        let mut f = fs::File::open(&path).context(format!("failed to open file ({path:?})"))?;
         let mut s = String::new();
         f.read_to_string(&mut s)
-            .context(format!("failed to read file ({:?})", path))?;
+            .context(format!("failed to read file ({path:?})"))?;
         let c = toml::from_str(&s);
-        check_old_config(&s, c).context(format!("failed to parse toml ({:?})", path))?
+        check_old_config(&s, c).context(format!("failed to parse toml ({path:?})"))?
     } else {
         toml::from_str(CONFIG_DEFAULT).unwrap()
     };
 
-    Ok(config)
+    match opt.use_config {
+        Some(BuiltinConfig::Default) => Ok(toml::from_str(CONFIG_DEFAULT).unwrap()),
+        Some(BuiltinConfig::Large) => Ok(toml::from_str(CONFIG_LARGE).unwrap()),
+        None => Ok(config),
+    }
 }
 
 fn check_old_config(s: &str, config: Result<Config, toml::de::Error>) -> Result<Config, Error> {
@@ -234,7 +249,6 @@ fn check_old_config(s: &str, config: Result<Config, toml::de::Error>) -> Result<
 // Main
 // ---------------------------------------------------------------------------------------------------------------------
 
-#[cfg_attr(tarpaulin, skip)]
 fn main() {
     let err = Term::stderr();
 
@@ -254,18 +268,18 @@ fn main() {
     }
 }
 
-#[cfg_attr(tarpaulin, skip)]
 fn run() -> Result<(), Error> {
     let mut opt: Opt = Parser::parse();
     opt.watch_mode = opt.watch || opt.watch_interval.is_some();
 
-    if opt.config {
-        run_config()
+    if opt.gen_config {
+        run_gen_config()
     } else if opt.list {
-        run_list()
-    } else if let Some(shell) = opt.completion {
+        run_list();
+        Ok(())
+    } else if let Some(shell) = opt.gen_completion {
         //Opt::clap().gen_completions("procs", shell, "./");
-        clap_complete::generate_to(shell, &mut Opt::into_app(), "procs", "./")?;
+        clap_complete::generate_to(shell, &mut Opt::command(), "procs", "./")?;
         let path = match shell {
             Shell::Bash => "./procs.bash",
             Shell::Elvish => "./procs.elv",
@@ -274,34 +288,34 @@ fn run() -> Result<(), Error> {
             Shell::Zsh => "./_procs",
             x => return Err(anyhow!("unknown shell type: {}", x)),
         };
-        println!("completion file is generated: {}", path);
-        return Ok(());
-    } else if let Some(shell) = opt.completion_out {
+        println!("completion file is generated: {path}");
+        Ok(())
+    } else if let Some(shell) = opt.gen_completion_out {
         //Opt::clap().gen_completions_to("procs", shell, &mut stdout());
-        clap_complete::generate(shell, &mut Opt::into_app(), "procs", &mut stdout());
-        return Ok(());
+        clap_complete::generate(shell, &mut Opt::command(), "procs", &mut stdout());
+        Ok(())
     } else {
-        let config = get_config()?;
+        let config = get_config(&opt)?;
         if opt.watch_mode {
             let interval = match opt.watch_interval {
                 Some(n) => (n * 1000.0).round() as u64,
                 None => 1000,
             };
-            run_watch(&opt, &config, interval)
+            run_watch(&mut opt, &config, interval)
         } else {
-            run_default(&opt, &config)
+            run_default(&mut opt, &config)
         }
     }
 }
 
-fn run_config() -> Result<(), Error> {
+fn run_gen_config() -> Result<(), Error> {
     let config: Config = toml::from_str(CONFIG_DEFAULT).unwrap();
     let toml = toml::to_string(&config)?;
-    println!("{}", toml);
+    println!("{toml}");
     Ok(())
 }
 
-fn run_list() -> Result<(), Error> {
+fn run_list() {
     let mut width = 0;
     let mut list = Vec::new();
     let mut desc = HashMap::new();
@@ -311,8 +325,6 @@ fn run_list() -> Result<(), Error> {
         width = cmp::max(width, UnicodeWidthStr::width(*v));
     }
 
-    list.sort();
-
     println!("Column kind list:");
     for l in list {
         println!(
@@ -321,16 +333,13 @@ fn run_list() -> Result<(), Error> {
             desc[l]
         );
     }
-
-    Ok(())
 }
 
-#[cfg_attr(tarpaulin, skip)]
-fn run_watch(opt: &Opt, config: &Config, interval: u64) -> Result<(), Error> {
+fn run_watch(opt: &mut Opt, config: &Config, interval: u64) -> Result<(), Error> {
     Watcher::start(opt, config, interval)
 }
 
-fn run_default(opt: &Opt, config: &Config) -> Result<(), Error> {
+fn run_default(opt: &mut Opt, config: &Config) -> Result<(), Error> {
     let mut time = Instant::now();
 
     let theme = get_theme(opt, config);
@@ -341,7 +350,7 @@ fn run_default(opt: &Opt, config: &Config) -> Result<(), Error> {
         lap(&mut time, "Info: View::new");
     }
 
-    view.filter(opt, config);
+    view.filter(opt, config, 1);
 
     if opt.debug {
         lap(&mut time, "Info: view.filter");
@@ -373,8 +382,8 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
@@ -385,52 +394,46 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs", "root"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "--or", "root", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "--and", "root", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "--nor", "root", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "--nand", "root", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         config.search.nonnumeric_search = ConfigSearchKind::Exact;
         config.search.numeric_search = ConfigSearchKind::Partial;
         let args = vec!["procs", "root", "1"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
     #[test]
-    fn test_run_config() {
-        let ret = run_config();
-        assert!(ret.is_ok());
-    }
-
-    #[test]
-    fn test_run_list() {
-        let ret = run_list();
+    fn test_run_gen_config() {
+        let ret = run_gen_config();
         assert!(ret.is_ok());
     }
 
@@ -441,9 +444,9 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs"];
-        let opt = Opt::from_iter(args.iter());
+        let mut opt = Opt::parse_from(args.iter());
         config.pager.mode = ConfigPagerMode::Disable;
-        let ret = run_default(&opt, &config);
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
@@ -454,8 +457,8 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs", "--insert", "ppid"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
@@ -466,13 +469,13 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs", "--sorta", "cpu"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
 
         let args = vec!["procs", "--sortd", "cpu"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
@@ -483,8 +486,8 @@ mod tests {
         config.display.theme = ConfigTheme::Dark;
 
         let args = vec!["procs", "--tree"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 
@@ -498,8 +501,20 @@ mod tests {
         let _udp = std::net::UdpSocket::bind("127.0.0.1:10000");
 
         let args = vec!["procs"];
-        let opt = Opt::from_iter(args.iter());
-        let ret = run_default(&opt, &config);
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
+        assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_run_use_config() {
+        let mut config: Config = toml::from_str(CONFIG_DEFAULT).unwrap();
+        config.pager.mode = ConfigPagerMode::Disable;
+        config.display.theme = ConfigTheme::Dark;
+
+        let args = vec!["procs", "--use-config", "large"];
+        let mut opt = Opt::parse_from(args.iter());
+        let ret = run_default(&mut opt, &config);
         assert!(ret.is_ok());
     }
 }
