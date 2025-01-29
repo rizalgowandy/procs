@@ -1,12 +1,27 @@
 use crate::column::Column;
 use crate::columns::{ConfigColumnKind, KIND_LIST};
-use crate::config::{Config, ConfigColumnAlign, ConfigSearchLogic, ConfigTheme};
+use crate::config::{Config, ConfigColumnAlign, ConfigSearchCase, ConfigSearchLogic, ConfigTheme};
+use crate::opt::ArgThemeMode;
 use crate::Opt;
-use byte_unit::Byte;
+use byte_unit::{Byte, UnitType};
 use std::borrow::Cow;
+use std::io;
+use std::io::IsTerminal;
 use std::time::Duration;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+#[cfg(not(target_os = "windows"))]
+use uzers::UsersCache;
+
+impl From<ArgThemeMode> for ConfigTheme {
+    fn from(item: ArgThemeMode) -> Self {
+        match item {
+            ArgThemeMode::Auto => ConfigTheme::Auto,
+            ArgThemeMode::Dark => ConfigTheme::Dark,
+            ArgThemeMode::Light => ConfigTheme::Light,
+        }
+    }
+}
 
 pub enum KeywordClass {
     Numeric,
@@ -18,6 +33,7 @@ pub fn find_partial<T: AsRef<str>>(
     pid: i32,
     keyword: &[T],
     logic: &ConfigSearchLogic,
+    case: &ConfigSearchCase,
 ) -> bool {
     let mut ret = match logic {
         ConfigSearchLogic::And => true,
@@ -27,8 +43,23 @@ pub fn find_partial<T: AsRef<str>>(
     };
     for w in keyword {
         let mut hit = false;
+        let keyword = w.as_ref();
+        let keyword_lowercase = keyword.to_ascii_lowercase();
+
+        let ignore_case = match case {
+            ConfigSearchCase::Smart => keyword == keyword.to_ascii_lowercase(),
+            ConfigSearchCase::Insensitive => true,
+            ConfigSearchCase::Sensitive => false,
+        };
+
+        let (keyword, content_to_lowercase) = if ignore_case {
+            (keyword_lowercase.as_str(), true)
+        } else {
+            (keyword, false)
+        };
+
         for c in columns {
-            if c.find_partial(pid, w.as_ref()) {
+            if c.find_partial(pid, keyword, content_to_lowercase) {
                 hit = true;
                 break;
             }
@@ -48,6 +79,7 @@ pub fn find_exact<T: AsRef<str>>(
     pid: i32,
     keyword: &[T],
     logic: &ConfigSearchLogic,
+    case: &ConfigSearchCase,
 ) -> bool {
     let mut ret = match logic {
         ConfigSearchLogic::And => true,
@@ -57,8 +89,23 @@ pub fn find_exact<T: AsRef<str>>(
     };
     for w in keyword {
         let mut hit = false;
+        let keyword = w.as_ref();
+        let keyword_lowercase = keyword.to_ascii_lowercase();
+
+        let ignore_case = match case {
+            ConfigSearchCase::Smart => keyword == keyword.to_ascii_lowercase(),
+            ConfigSearchCase::Insensitive => true,
+            ConfigSearchCase::Sensitive => false,
+        };
+
+        let (keyword, content_to_lowercase) = if ignore_case {
+            (keyword_lowercase.as_str(), true)
+        } else {
+            (keyword, false)
+        };
+
         for c in columns {
-            if c.find_exact(pid, w.as_ref()) {
+            if c.find_exact(pid, keyword, content_to_lowercase) {
                 hit = true;
                 break;
             }
@@ -117,11 +164,11 @@ pub fn parse_time(x: u64) -> String {
     let year = x as f64 / (365.0 * 60.0 * 60.0 * 24.0);
 
     if year >= 1.0 {
-        format!("{:.1}years", year)
+        format!("{year:.1}years")
     } else if day >= 1.0 {
-        format!("{:.1}days", day)
+        format!("{day:.1}days")
     } else {
-        format!("{:02}:{:02}:{:02}", hour, min, sec)
+        format!("{hour:02}:{min:02}:{sec:02}")
     }
 }
 
@@ -141,11 +188,7 @@ pub fn truncate(s: &'_ str, width: usize) -> Cow<'_, str> {
             buf.push(c);
             continue;
         }
-        total_width += if let Some(x) = UnicodeWidthChar::width(c) {
-            x
-        } else {
-            0
-        };
+        total_width += UnicodeWidthChar::width(c).unwrap_or_default();
         if total_width > width {
             ret = Some(buf);
             break;
@@ -160,16 +203,22 @@ pub fn truncate(s: &'_ str, width: usize) -> Cow<'_, str> {
 }
 
 pub fn find_column_kind(pat: &str) -> Option<ConfigColumnKind> {
+    // strict search at first
     for (k, (v, _)) in KIND_LIST.iter() {
-        if v.to_lowercase().find(&pat.to_lowercase()).is_some() {
+        if v.to_lowercase().eq(&pat.to_lowercase()) {
             return Some(k.clone());
         }
     }
-    eprintln!("Can't find column kind: {}", pat);
+
+    for (k, (v, _)) in KIND_LIST.iter() {
+        if v.to_lowercase().contains(&pat.to_lowercase()) {
+            return Some(k.clone());
+        }
+    }
+    eprintln!("Can't find column kind: {pat}");
     None
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "macos")]
 pub fn change_endian(val: u32) -> u32 {
     let mut ret = 0;
@@ -180,7 +229,6 @@ pub fn change_endian(val: u32) -> u32 {
     ret
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "macos")]
 pub unsafe fn get_sys_value(
     high: u32,
@@ -201,7 +249,6 @@ pub unsafe fn get_sys_value(
     ) == 0
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "windows")]
 pub fn format_sid(sid: &[u64], abbr: bool) -> String {
     let mut ret = format!("S-{}-{}-{}", sid[0], sid[1], sid[2]);
@@ -219,12 +266,9 @@ pub fn format_sid(sid: &[u64], abbr: bool) -> String {
 }
 
 pub fn bytify(x: u64) -> String {
-    let byte = Byte::from_bytes(x as u128);
-    let byte = byte.get_appropriate_unit(true);
-    byte.format(3)
-        .replace(" ", "")
-        .replace("B", "")
-        .replace("i", "")
+    let byte = Byte::from_u64(x);
+    let byte = byte.get_appropriate_unit(UnitType::Binary);
+    format!("{:.3}", byte).replace([' ', 'B', 'i'], "")
 }
 
 pub fn lap(instant: &mut Instant, msg: &str) {
@@ -233,25 +277,32 @@ pub fn lap(instant: &mut Instant, msg: &str) {
         "{} [{}.{:03}s]",
         msg,
         period.as_secs(),
-        period.subsec_nanos() / 1000000
+        period.subsec_millis()
     );
     instant.clone_from(&Instant::now());
 }
 
 pub fn get_theme(opt: &Opt, config: &Config) -> ConfigTheme {
-    let theme = match (opt.theme.as_ref(), &config.display.theme) {
-        (Some(x), _) => match x.as_str() {
-            "auto" => ConfigTheme::Auto,
-            "dark" => ConfigTheme::Dark,
-            "light" => ConfigTheme::Light,
-            _ => unreachable!(),
-        },
+    let theme = match (opt.theme, &config.display.theme) {
+        (Some(x), _) => x.into(),
         (_, x) => x.clone(),
     };
     match theme {
         ConfigTheme::Auto => {
-            if console::user_attended() {
-                let timeout = Duration::from_millis(100);
+            if io::stdout().is_terminal() && io::stderr().is_terminal() && io::stdin().is_terminal()
+            {
+                let minimum_timeout = Duration::from_millis(100);
+                let timeout = if let Ok(latency) = termbg::latency(Duration::from_millis(1000)) {
+                    if latency * 2 > minimum_timeout {
+                        latency * 2
+                    } else {
+                        minimum_timeout
+                    }
+                } else {
+                    // If latency detection failed, fallback to dark theme
+                    return ConfigTheme::Dark;
+                };
+
                 if let Ok(theme) = termbg::theme(timeout) {
                     match theme {
                         termbg::Theme::Dark => ConfigTheme::Dark,
@@ -267,5 +318,35 @@ pub fn get_theme(opt: &Opt, config: &Config) -> ConfigTheme {
             }
         }
         x => x,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+thread_local! {
+    pub static USERS_CACHE: std::cell::RefCell<UsersCache> = UsersCache::new().into();
+}
+
+#[cfg(target_os = "freebsd")]
+// std::ffi::FromBytesUntilNulError is missing until Rust 1.73.0
+// https://github.com/rust-lang/rust/pull/113701
+pub fn ptr_to_cstr(
+    x: &[std::os::raw::c_char],
+) -> Result<&std::ffi::CStr, core::ffi::FromBytesUntilNulError> {
+    let ptr = x.as_ptr() as *const u8;
+    let len = x.len();
+    let x = unsafe { std::slice::from_raw_parts::<u8>(ptr, len) };
+    std::ffi::CStr::from_bytes_until_nul(x)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn process_new(
+    pid: i32,
+    procfs: &Option<std::path::PathBuf>,
+) -> procfs::ProcResult<procfs::process::Process> {
+    if let Some(ref x) = procfs {
+        let path = x.join(pid.to_string());
+        procfs::process::Process::new_with_root(path)
+    } else {
+        procfs::process::Process::new(pid)
     }
 }

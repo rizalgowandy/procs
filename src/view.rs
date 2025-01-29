@@ -1,6 +1,7 @@
 use crate::column::Column;
 use crate::columns::*;
 use crate::config::*;
+use crate::opt::{ArgColorMode, ArgPagerMode};
 use crate::process::collect_proc;
 use crate::style::{apply_color, apply_style, color_to_column_style};
 use crate::term_info::TermInfo;
@@ -28,37 +29,58 @@ pub struct View {
 }
 
 impl View {
-    pub fn new(opt: &Opt, config: &Config, clear_by_line: bool) -> Result<Self, Error> {
+    pub fn new(opt: &mut Opt, config: &Config, clear_by_line: bool) -> Result<Self, Error> {
         let mut slot_idx = 0;
         let mut columns = Vec::new();
-        if opt.tree {
-            let kind = ConfigColumnKind::Tree;
-            let column = gen_column(
-                &kind,
-                None,
-                &config.docker.path,
-                &config.display.separator,
-                config.display.abbr_sid,
-                &config.display.tree_symbols,
-            );
-            if column.available() {
-                columns.push(ColumnInfo {
-                    column,
-                    kind,
-                    style: color_to_column_style(&config.style.tree),
-                    nonnumeric_search: false,
-                    numeric_search: false,
-                    align: ConfigColumnAlign::Left,
-                    max_width: None,
-                    min_width: None,
-                    visible: true,
-                });
-            }
-        }
-
         let mut only_kind_found = false;
 
-        for c in &config.columns {
+        // Override style of TreeSlot
+        let tree_slot = ConfigColumn {
+            kind: ConfigColumnKind::TreeSlot,
+            style: color_to_column_style(&config.style.tree),
+            numeric_search: false,
+            nonnumeric_search: false,
+            align: ConfigColumnAlign::Left,
+            max_width: None,
+            min_width: None,
+            header: None,
+        };
+
+        // Adding the sort column to inserts if not already present
+        match (&opt.sorta, &opt.sortd) {
+            (_, Some(col)) | (Some(col), _) => {
+                if !opt.insert.contains(col) {
+                    opt.insert.push(col.clone());
+                }
+            }
+            _ => {}
+        }
+
+        // Add default TreeSlot if there is not TreeSlot in config
+        let config_columns = if config
+            .columns
+            .iter()
+            .all(|x| x.kind != ConfigColumnKind::TreeSlot)
+            && opt.tree
+        {
+            let mut ret = vec![tree_slot];
+            ret.append(&mut config.columns.clone());
+            ret
+        } else {
+            config
+                .columns
+                .iter()
+                .map(|x| {
+                    if x.kind == ConfigColumnKind::TreeSlot {
+                        tree_slot.clone()
+                    } else {
+                        x.clone()
+                    }
+                })
+                .collect()
+        };
+
+        for c in &config_columns {
             let kinds = match &c.kind {
                 ConfigColumnKind::Slot => {
                     let kinds = if let Some(insert) = opt.insert.get(slot_idx) {
@@ -79,13 +101,20 @@ impl View {
                     }
                     kinds
                 }
+                ConfigColumnKind::TreeSlot => {
+                    if opt.tree {
+                        vec![ConfigColumnKind::Tree]
+                    } else {
+                        vec![]
+                    }
+                }
                 x => vec![x.clone()],
             };
 
             for kind in kinds {
-                let visible = if let Some(ref only) = opt.only {
+                let visible = if let Some(only) = &opt.only {
                     let kind_name = KIND_LIST[&kind].0.to_lowercase();
-                    if kind_name.find(&only.to_lowercase()).is_none() {
+                    if !kind_name.contains(&only.to_lowercase()) {
                         false
                     } else {
                         only_kind_found = true;
@@ -102,6 +131,7 @@ impl View {
                     &config.display.separator,
                     config.display.abbr_sid,
                     &config.display.tree_symbols,
+                    opt.procfs.clone(),
                 );
                 if column.available() {
                     columns.push(ColumnInfo {
@@ -123,7 +153,7 @@ impl View {
             bail!("There is not enough slot for inserting columns {:?}.\nPlease add \"Slot\" or \"MultiSlot\" to your config.\nhttps://github.com/dalance/procs#insert-column", opt.insert);
         }
 
-        if let Some(ref only_kind) = opt.only {
+        if let Some(only_kind) = &opt.only {
             if !only_kind_found {
                 bail!("kind \"{}\" is not found in columns", only_kind);
             }
@@ -137,16 +167,21 @@ impl View {
             config.display.show_thread
         };
 
-        let proc = collect_proc(Duration::from_millis(opt.interval), show_thread);
+        let proc = collect_proc(
+            Duration::from_millis(opt.interval),
+            show_thread,
+            config.display.show_kthreads,
+            &opt.procfs,
+        );
         for c in columns.iter_mut() {
             for p in &proc {
-                c.column.add(&p);
+                c.column.add(p);
             }
         }
 
         let mut parent_pids = HashMap::new();
         let mut child_pids = HashMap::<i32, Vec<i32>>::new();
-        if opt.tree {
+        if opt.tree || !config.display.show_self_parents {
             for p in &proc {
                 parent_pids.insert(p.pid, p.ppid);
                 if let Some(x) = child_pids.get_mut(&p.ppid) {
@@ -157,7 +192,7 @@ impl View {
             }
         }
 
-        let term_info = TermInfo::new(clear_by_line);
+        let term_info = TermInfo::new(clear_by_line, false)?;
         let mut sort_info = View::get_sort_info(opt, config, &columns);
 
         if opt.only.is_some() {
@@ -175,7 +210,7 @@ impl View {
         })
     }
 
-    pub fn filter(&mut self, opt: &Opt, config: &Config) {
+    pub fn filter(&mut self, opt: &Opt, config: &Config, header_lines: usize) {
         let mut cols_nonnumeric = Vec::new();
         let mut cols_numeric = Vec::new();
         for c in &self.columns {
@@ -203,6 +238,23 @@ impl View {
 
         let self_pid = std::process::id() as i32;
 
+        let self_parents = if !config.display.show_self_parents {
+            let mut self_parents = Vec::new();
+            self.get_parent_pids(self_pid, &mut self_parents);
+            self_parents
+                .into_iter()
+                .filter(|x| {
+                    if let Some(x) = self.child_pids.get(x) {
+                        x.len() == 1
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let logic = if opt.and {
             ConfigSearchLogic::And
         } else if opt.or {
@@ -217,7 +269,10 @@ impl View {
 
         let mut candidate_pids = Vec::new();
         for pid in &pids {
-            let candidate = if !config.display.show_self && *pid == self_pid {
+            let hidden_process = (!config.display.show_self && *pid == self_pid)
+                || (!config.display.show_self_parents && self_parents.contains(pid));
+
+            let candidate = if hidden_process {
                 false
             } else if opt.keyword.is_empty() {
                 true
@@ -228,7 +283,7 @@ impl View {
                     &keyword_nonnumeric,
                     cols_numeric.as_slice(),
                     cols_nonnumeric.as_slice(),
-                    &config,
+                    config,
                     &logic,
                 )
             };
@@ -266,7 +321,8 @@ impl View {
                 visible_pids.push(*pid);
             }
 
-            if opt.watch_mode && visible_pids.len() >= self.term_info.height - 5 {
+            let reserved_rows = 4 + header_lines;
+            if opt.watch_mode && visible_pids.len() >= self.term_info.height - reserved_rows {
                 break;
             }
         }
@@ -304,7 +360,7 @@ impl View {
             };
             c.column.apply_visible(&self.visible_pids);
             let min_width = min_widths.get(&i).map(|x| Some(*x)).unwrap_or(c.min_width);
-            c.column.reset_width(order, &config, c.max_width, min_width);
+            c.column.reset_width(order, config, c.max_width, min_width);
             for pid in &self.visible_pids {
                 c.column.update_width(*pid, c.max_width);
             }
@@ -331,46 +387,55 @@ impl View {
                 + self.columns.len()
                 - 1
         } else {
-            std::usize::MIN
+            usize::MIN
         };
 
-        let use_pager = if cfg!(target_os = "windows") {
-            false
+        let use_builtin_pager = if cfg!(target_os = "windows") {
+            true
         } else {
-            match (opt.watch_mode, opt.pager.as_ref(), &config.pager.mode) {
-                (true, _, _) => false,
-                (false, Some(x), _) if x == "auto" => {
-                    self.term_info.height < pager_threshold_height
-                        || self.term_info.width < pager_threshold_width
-                }
-                (false, Some(x), _) if x == "always" => true,
-                (false, Some(x), _) if x == "disable" => false,
-                (false, None, ConfigPagerMode::Auto) => {
-                    self.term_info.height < pager_threshold_height
-                        || self.term_info.width < pager_threshold_width
-                }
-                (false, None, ConfigPagerMode::Always) => true,
-                (false, None, ConfigPagerMode::Disable) => false,
-                _ => false,
-            }
+            config.pager.use_builtin
         };
 
-        let mut truncate = use_terminal && use_pager && config.display.cut_to_pager;
+        let use_pager = match (opt.watch_mode, opt.pager.as_ref(), &config.pager.mode) {
+            (true, _, _) => false,
+            (false, Some(ArgPagerMode::Auto), _) => {
+                self.term_info.height < pager_threshold_height
+                    || self.term_info.width < pager_threshold_width
+            }
+            (false, Some(ArgPagerMode::Always), _) => true,
+            (false, Some(ArgPagerMode::Disable), _) => false,
+            (false, None, ConfigPagerMode::Auto) => {
+                self.term_info.height < pager_threshold_height
+                    || self.term_info.width < pager_threshold_width
+            }
+            (false, None, ConfigPagerMode::Always) => true,
+            (false, None, ConfigPagerMode::Disable) => false,
+        };
+
+        // Minus doesn't support horizontal scroll yet
+        // https://github.com/arijit79/minus/issues/59
+        let cut_to_pager = if use_builtin_pager {
+            true
+        } else {
+            config.display.cut_to_pager
+        };
+
+        let mut truncate = use_terminal && use_pager && cut_to_pager;
         truncate |= use_terminal && !use_pager && config.display.cut_to_terminal;
         truncate |= !use_terminal && config.display.cut_to_pipe;
 
         if !truncate {
-            self.term_info.width = std::usize::MAX;
+            self.term_info.width = usize::MAX;
         }
 
         match (opt.color.as_ref(), &config.display.color_mode) {
-            (Some(x), _) if x == "auto" => {
+            (Some(ArgColorMode::Auto), _) => {
                 if use_pager && use_terminal {
                     console::set_colors_enabled(true);
                 }
             }
-            (Some(x), _) if x == "always" => console::set_colors_enabled(true),
-            (Some(x), _) if x == "disable" => console::set_colors_enabled(false),
+            (Some(ArgColorMode::Always), _) => console::set_colors_enabled(true),
+            (Some(ArgColorMode::Disable), _) => console::set_colors_enabled(false),
             (None, ConfigColorMode::Auto) => {
                 if use_pager && use_terminal {
                     console::set_colors_enabled(true);
@@ -378,30 +443,42 @@ impl View {
             }
             (None, ConfigColorMode::Always) => console::set_colors_enabled(true),
             (None, ConfigColorMode::Disable) => console::set_colors_enabled(false),
-            _ => (),
         }
 
         if use_pager {
-            View::pager(&config);
+            if use_builtin_pager {
+                self.term_info.use_pager = true;
+            } else {
+                View::pager(config);
+            }
         }
 
-        if !opt.no_header {
+        if !opt.no_header && config.display.show_header {
             // Ignore display_* error
             //   `Broken pipe` may occur at pager mode. It can be ignored safely.
-            let _ = self.display_header(&config, theme);
-            let _ = self.display_unit(&config, theme);
+            let _ = self.display_header(config, theme);
+            let _ = self.display_unit(config, theme);
         }
 
         for pid in &self.visible_pids {
             let auxiliary = self.auxiliary_pids.contains(pid);
-            let _ = self.display_content(&config, *pid, theme, auxiliary);
+            let _ = self.display_content(config, *pid, theme, auxiliary);
+        }
+
+        if !opt.no_header && config.display.show_footer {
+            let _ = self.display_unit(config, theme);
+            let _ = self.display_header(config, theme);
+        }
+
+        if self.term_info.use_pager {
+            minus::page_all(self.term_info.pager.replace(None).unwrap())?;
         }
 
         Ok(())
     }
 
     fn display_header(&self, config: &Config, theme: &ConfigTheme) -> Result<(), Error> {
-        let mut row = String::from("");
+        let mut row = String::new();
         for (i, c) in self.columns.iter().enumerate() {
             if c.visible {
                 let order = if i == self.sort_info.idx {
@@ -428,7 +505,7 @@ impl View {
     }
 
     fn display_unit(&self, config: &Config, theme: &ConfigTheme) -> Result<(), Error> {
-        let mut row = String::from("");
+        let mut row = String::new();
         for c in &self.columns {
             if c.visible {
                 row = format!(
@@ -456,7 +533,7 @@ impl View {
         theme: &ConfigTheme,
         auxiliary: bool,
     ) -> Result<(), Error> {
-        let mut row = String::from("");
+        let mut row = String::new();
         for c in &self.columns {
             if c.visible {
                 row = format!(
@@ -485,7 +562,7 @@ impl View {
                 let mut order = config.sort.order.clone();
                 for (i, c) in cols.iter().enumerate() {
                     let (kind, _) = KIND_LIST[&c.kind];
-                    if kind.to_lowercase().find(&sort.to_lowercase()).is_some() {
+                    if kind.to_lowercase().contains(&sort.to_lowercase()) {
                         idx = i;
                         order = if opt.sorta.is_some() {
                             ConfigSortOrder::Ascending
@@ -501,7 +578,10 @@ impl View {
         };
 
         if opt.tree {
-            sort_idx = 0;
+            sort_idx = cols
+                .iter()
+                .position(|x| x.kind == ConfigColumnKind::Tree)
+                .unwrap();
         }
 
         SortInfo {
@@ -520,14 +600,36 @@ impl View {
         logic: &ConfigSearchLogic,
     ) -> bool {
         let ret_nonnumeric = match config.search.nonnumeric_search {
-            ConfigSearchKind::Partial => {
-                find_partial(cols_nonnumeric, pid, keyword_nonnumeric, logic)
-            }
-            ConfigSearchKind::Exact => find_exact(cols_nonnumeric, pid, keyword_nonnumeric, logic),
+            ConfigSearchKind::Partial => find_partial(
+                cols_nonnumeric,
+                pid,
+                keyword_nonnumeric,
+                logic,
+                &config.search.case,
+            ),
+            ConfigSearchKind::Exact => find_exact(
+                cols_nonnumeric,
+                pid,
+                keyword_nonnumeric,
+                logic,
+                &config.search.case,
+            ),
         };
         let ret_numeric = match config.search.numeric_search {
-            ConfigSearchKind::Partial => find_partial(cols_numeric, pid, keyword_numeric, logic),
-            ConfigSearchKind::Exact => find_exact(cols_numeric, pid, keyword_numeric, logic),
+            ConfigSearchKind::Partial => find_partial(
+                cols_numeric,
+                pid,
+                keyword_numeric,
+                logic,
+                &config.search.case,
+            ),
+            ConfigSearchKind::Exact => find_exact(
+                cols_numeric,
+                pid,
+                keyword_numeric,
+                logic,
+                &config.search.case,
+            ),
         };
         match logic {
             ConfigSearchLogic::And => ret_nonnumeric & ret_numeric,
@@ -537,10 +639,10 @@ impl View {
         }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", any(target_os = "linux", target_os = "android"))))]
     fn pager(config: &Config) {
         if let Some(ref pager) = config.pager.command {
-            Pager::with_pager(&pager).setup();
+            Pager::with_pager(pager).setup();
         } else if which::which("less").is_ok() {
             Pager::with_pager("less -SR").setup();
         } else {
@@ -548,16 +650,16 @@ impl View {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn pager(config: &Config) {
         if let Some(ref pager) = config.pager.command {
-            Pager::with_pager(&pager)
-                // workaround for default less charset is "acsii" on some environments (ex. Ubuntu)
-                .pager_envs(&["LESSCHARSET=utf-8"])
+            Pager::with_pager(pager)
+                // workaround for default less charset is "ascii" on some environments (ex. Ubuntu)
+                .pager_envs(["LESSCHARSET=utf-8\0"])
                 .setup();
         } else if which::which("less").is_ok() {
             Pager::with_pager("less -SR")
-                .pager_envs(&["LESSCHARSET=utf-8"])
+                .pager_envs(["LESSCHARSET=utf-8\0"])
                 .setup();
         } else {
             Pager::with_pager("more -f").setup();
@@ -567,7 +669,6 @@ impl View {
     #[cfg(target_os = "windows")]
     fn pager(_config: &Config) {}
 
-    #[cfg_attr(tarpaulin, skip)]
     pub fn inc_sort_column(&mut self) -> usize {
         let current = self.sort_info.idx;
         let max_idx = self.columns.len();
@@ -581,7 +682,6 @@ impl View {
         current
     }
 
-    #[cfg_attr(tarpaulin, skip)]
     pub fn dec_sort_column(&mut self) -> usize {
         let current = self.sort_info.idx;
         let max_idx = self.columns.len();
