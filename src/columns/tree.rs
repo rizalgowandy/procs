@@ -14,9 +14,9 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(symbols: &[String; 5]) -> Self {
-        let header = String::from("");
-        let unit = String::from("");
-        Tree {
+        let header = String::new();
+        let unit = String::new();
+        Self {
             width: 0,
             header,
             unit,
@@ -31,7 +31,7 @@ impl Column for Tree {
     fn add(&mut self, proc: &ProcessInfo) {
         if let Some(node) = self.tree.get_mut(&proc.ppid) {
             node.push(proc.pid);
-            node.sort();
+            node.sort_unstable();
         } else {
             self.tree.insert(proc.ppid, vec![proc.pid]);
         }
@@ -64,7 +64,7 @@ impl Column for Tree {
                     string
                 } else if let Some(pppid) = rev_tree.get(ppid) {
                     let brother = tree.get(pppid).unwrap();
-                    let is_last = brother.binary_search(&ppid).unwrap() == brother.len() - 1;
+                    let is_last = brother.binary_search(ppid).unwrap() == brother.len() - 1;
 
                     if is_last {
                         string.push(' ');
@@ -86,11 +86,11 @@ impl Column for Tree {
                 &self.rev_tree,
                 &self.symbols,
                 pid,
-                String::from(""),
+                String::new(),
             );
             let root: String = root.chars().rev().collect();
 
-            let brother = &self.tree[&ppid];
+            let brother = &self.tree[ppid];
             let is_last = brother.binary_search(&pid).unwrap() == brother.len() - 1;
             let has_child = self.tree.contains_key(&pid);
 
@@ -118,11 +118,11 @@ impl Column for Tree {
         }
     }
 
-    fn find_partial(&self, _pid: i32, _keyword: &str) -> bool {
+    fn find_partial(&self, _pid: i32, _keyword: &str, _content_to_lowercase: bool) -> bool {
         false
     }
 
-    fn find_exact(&self, _pid: i32, _keyword: &str) -> bool {
+    fn find_exact(&self, _pid: i32, _keyword: &str, _content_to_lowercase: bool) -> bool {
         false
     }
 
@@ -137,7 +137,7 @@ impl Column for Tree {
                 }
             }
         }
-        root_pids.sort();
+        root_pids.sort_unstable();
         root_pids.dedup();
 
         fn push_pid(tree: &HashMap<i32, Vec<i32>>, mut pids: Vec<i32>, pid: i32) -> Vec<i32> {
@@ -209,7 +209,7 @@ impl Column for Tree {
 }
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod tests {
     use super::*;
     use crate::process::ProcessTask;
@@ -226,33 +226,54 @@ mod tests {
             String::from("└"),
         ]);
 
+        let curr_proc = ProcessTask::Process {
+            stat: Process::myself().unwrap().stat().unwrap(),
+            proc: Process::myself().unwrap(),
+            owner: Process::myself().unwrap().uid().unwrap(),
+        };
+        let prev_stat = Process::myself().unwrap().stat().unwrap();
+
         let p0 = ProcessInfo {
             pid: 0,
             ppid: 0,
-            curr_proc: ProcessTask::Process(Process::myself().unwrap()),
-            prev_proc: ProcessTask::Process(Process::myself().unwrap()),
+            curr_proc,
+            prev_stat,
             curr_io: None,
             prev_io: None,
             curr_status: None,
             interval: Duration::new(0, 0),
         };
+
+        let curr_proc = ProcessTask::Process {
+            stat: Process::myself().unwrap().stat().unwrap(),
+            proc: Process::myself().unwrap(),
+            owner: Process::myself().unwrap().uid().unwrap(),
+        };
+        let prev_stat = Process::myself().unwrap().stat().unwrap();
 
         let p1 = ProcessInfo {
             pid: 1,
             ppid: 0,
-            curr_proc: ProcessTask::Process(Process::myself().unwrap()),
-            prev_proc: ProcessTask::Process(Process::myself().unwrap()),
+            curr_proc,
+            prev_stat,
             curr_io: None,
             prev_io: None,
             curr_status: None,
             interval: Duration::new(0, 0),
         };
 
+        let curr_proc = ProcessTask::Process {
+            stat: Process::myself().unwrap().stat().unwrap(),
+            proc: Process::myself().unwrap(),
+            owner: Process::myself().unwrap().uid().unwrap(),
+        };
+        let prev_stat = Process::myself().unwrap().stat().unwrap();
+
         let p2 = ProcessInfo {
             pid: 2,
             ppid: 1,
-            curr_proc: ProcessTask::Process(Process::myself().unwrap()),
-            prev_proc: ProcessTask::Process(Process::myself().unwrap()),
+            curr_proc,
+            prev_stat,
             curr_io: None,
             prev_io: None,
             curr_status: None,
@@ -266,27 +287,18 @@ mod tests {
         tree.update_width(1, None);
         tree.update_width(2, None);
         assert_eq!(
-            format!(
-                "{}",
-                tree.display_content(0, &crate::config::ConfigColumnAlign::Left)
-                    .unwrap()
-            ),
+            tree.display_content(0, &crate::config::ConfigColumnAlign::Left)
+                .unwrap(),
             String::from("├┬────")
         );
         assert_eq!(
-            format!(
-                "{}",
-                tree.display_content(1, &crate::config::ConfigColumnAlign::Left)
-                    .unwrap()
-            ),
+            tree.display_content(1, &crate::config::ConfigColumnAlign::Left)
+                .unwrap(),
             String::from("│└┬───")
         );
         assert_eq!(
-            format!(
-                "{}",
-                tree.display_content(2, &crate::config::ConfigColumnAlign::Left)
-                    .unwrap()
-            ),
+            tree.display_content(2, &crate::config::ConfigColumnAlign::Left)
+                .unwrap(),
             String::from("│ └───")
         );
     }

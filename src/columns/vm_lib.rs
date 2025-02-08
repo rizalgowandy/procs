@@ -16,7 +16,7 @@ impl VmLib {
     pub fn new(header: Option<String>) -> Self {
         let header = header.unwrap_or_else(|| String::from("VmLib"));
         let unit = String::from("[bytes]");
-        VmLib {
+        Self {
             fmt_contents: HashMap::new(),
             raw_contents: HashMap::new(),
             width: 0,
@@ -33,10 +33,10 @@ impl Column for VmLib {
                 let val = val.saturating_mul(1024);
                 (val, bytify(val))
             } else {
-                (0, String::from(""))
+                (0, String::new())
             }
         } else {
-            (0, String::from(""))
+            (0, String::new())
         };
 
         self.fmt_contents.insert(proc.pid, fmt_content);

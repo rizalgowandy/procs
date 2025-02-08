@@ -14,8 +14,8 @@ pub struct UidSaved {
 impl UidSaved {
     pub fn new(header: Option<String>) -> Self {
         let header = header.unwrap_or_else(|| String::from("SUID"));
-        let unit = String::from("");
-        UidSaved {
+        let unit = String::new();
+        Self {
             fmt_contents: HashMap::new(),
             raw_contents: HashMap::new(),
             width: 0,
@@ -25,14 +25,14 @@ impl UidSaved {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Column for UidSaved {
     fn add(&mut self, proc: &ProcessInfo) {
         let (fmt_content, raw_content) = if let Some(ref status) = proc.curr_status {
             let uid = status.suid;
-            (format!("{}", uid), uid)
+            (format!("{uid}"), uid)
         } else {
-            (String::from(""), 0)
+            (String::new(), 0)
         };
 
         self.fmt_contents.insert(proc.pid, fmt_content);
@@ -42,11 +42,24 @@ impl Column for UidSaved {
     column_default!(u32);
 }
 
-#[cfg_attr(tarpaulin, skip)]
 #[cfg(target_os = "macos")]
 impl Column for UidSaved {
     fn add(&mut self, proc: &ProcessInfo) {
         let uid = proc.curr_task.pbsd.pbi_svuid;
+        let fmt_content = format!("{}", uid);
+        let raw_content = uid;
+
+        self.fmt_contents.insert(proc.pid, fmt_content);
+        self.raw_contents.insert(proc.pid, raw_content);
+    }
+
+    column_default!(u32);
+}
+
+#[cfg(target_os = "freebsd")]
+impl Column for UidSaved {
+    fn add(&mut self, proc: &ProcessInfo) {
+        let uid = proc.curr_proc.info.svuid;
         let fmt_content = format!("{}", uid);
         let raw_content = uid;
 
